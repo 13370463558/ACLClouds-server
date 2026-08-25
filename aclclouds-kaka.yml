@@ -1,0 +1,36 @@
+﻿name: AclClouds-卡卡自动续期
+
+on:
+  schedule:
+    # 每天 UTC 01:00（北京时间 09:00）
+    - cron: "0 1 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          pip install -r ACLClouds-server/requirements.txt
+
+      - name: 执行续期
+        env:
+          ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
+          ACL_ACCOUNTS: ${{ secrets.ACL_ACCOUNTS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python ACLClouds-server/renew.py
