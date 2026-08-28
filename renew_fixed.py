@@ -91,7 +91,12 @@ def parse_iso(s):
 
 # ==================== API 版 (纯 HTTP) ====================
 def build_api_session(cookie_str):
-    """构建 API session，正确处理 __Host- 前缀 cookie"""
+    """构建 API session，正确处理 __Host- 前缀 cookie
+
+    关键修复: 不再用 s.cookies.set (requests 的 prepare_cookies 会用 cookiejar
+    覆盖手动设置的 Cookie header, 而且 __Host- 前缀会被剥离导致服务器不识别),
+    而是保存原始 Cookie 字符串, 在 api_get/api_post 里强制覆盖。
+    """
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
@@ -100,51 +105,48 @@ def build_api_session(cookie_str):
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/projects",
     })
-    
-    # 解析并设置 cookie（保留原始字符串用于强制写入）
-    raw_cookie = []
-    for kv in cookie_str.split(";"):
-        kv = kv.strip()
-        if not kv or "=" not in kv:
-            continue
-        k, v = kv.split("=", 1)
-        k, v = k.strip(), v.strip()
-        raw_cookie.append(f"{k}={v}")
-        # 自动重命名 aclclouds_session → __Host-aclclouds_session
-        if k == "aclclouds_session" and "__Host-aclclouds_session" not in cookie_str:
-            k = "__Host-aclclouds_session"
-        s.cookies.set(k, v, domain=".aclclouds.com", path="/")
-    
-    # 保存原始 cookie 字符串（含 __Host- 前缀）
-    s._raw_cookie = "; ".join(raw_cookie)
+    # 保存原始 Cookie 字符串（含 __Host- 前缀, 原样发送）
+    s._raw_cookie = cookie_str.strip()
+    # 不写入 s.cookies, 防止 prepare_cookies 用剥离前缀的名字重建 header
     return s
 
 
+def get_xsrf(session):
+    """从原始 Cookie 字符串提取 XSRF-TOKEN (并 URL 解码)"""
+    raw = getattr(session, '_raw_cookie', '')
+    if raw:
+        for kv in raw.split(";"):
+            kv = kv.strip()
+            if kv.startswith("XSRF-TOKEN="):
+                return urllib.parse.unquote(kv[len("XSRF-TOKEN="):])
+    return None
+
+
 def api_get(session, path):
-    """发送 GET 请求，自动注入 XSRF token"""
+    """发送 GET 请求，自动注入 XSRF token，并强制覆盖原始 Cookie"""
     headers = {}
-    token = session.cookies.get("XSRF-TOKEN", domain=".aclclouds.com")
+    token = get_xsrf(session)
     if token:
-        headers["X-XSRF-TOKEN"] = urllib.parse.unquote(token)
-    
+        headers["X-XSRF-TOKEN"] = token
+
     req = requests.Request('GET', f"{BASE_URL}{path}", headers=headers)
     prepared = session.prepare_request(req)
-    # 强制覆盖 Cookie header
-    if hasattr(session, '_raw_cookie'):
+    # 强制覆盖 Cookie header (prepare_cookies 已删掉手动 header, 这里写回原样)
+    if getattr(session, '_raw_cookie', None):
         prepared.headers['Cookie'] = session._raw_cookie
     return session.send(prepared, timeout=30)
 
 
 def api_post(session, path, payload=None):
-    """发送 POST 请求，自动注入 XSRF token"""
+    """发送 POST 请求，自动注入 XSRF token，并强制覆盖原始 Cookie"""
     headers = {}
-    token = session.cookies.get("XSRF-TOKEN", domain=".aclclouds.com")
+    token = get_xsrf(session)
     if token:
-        headers["X-XSRF-TOKEN"] = urllib.parse.unquote(token)
-    
+        headers["X-XSRF-TOKEN"] = token
+
     req = requests.Request('POST', f"{BASE_URL}{path}", headers=headers, json=payload or {})
     prepared = session.prepare_request(req)
-    if hasattr(session, '_raw_cookie'):
+    if getattr(session, '_raw_cookie', None):
         prepared.headers['Cookie'] = session._raw_cookie
     return session.send(prepared, timeout=30)
 

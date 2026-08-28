@@ -33,4 +33,6 @@ jobs:
           ACL_ACCOUNTS: ${{ secrets.ACL_ACCOUNTS }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python renew.py
+        # 注意: 必须用 renew_fixed.py (修复 __Host- Cookie 前缀被剥离导致 401 的 bug)
+        # 旧版 renew.py 会 401 但仍 exit 0, 造成"假成功"
+        run: python renew_fixed.py
