@@ -1068,6 +1068,8 @@ def main():
         if fresh:
             accounts = [("main", fresh)]
             log("✅ 浏览器登录成功, 使用新 Cookie 执行续期")
+            if GH_TOKEN:
+                update_acl_secret(fresh)
         else:
             msg = ("❌ 浏览器登录失败\n\n"
                    "请检查:\n"
