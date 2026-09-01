@@ -458,42 +458,96 @@ def browser_login():
                     pass
                 return None
 
-            # Turnstile
+            # Turnstile: 多次点击直到真正通过 (响应 token 生成 / 页面验证提示消失)
             log("🔒 尝试通过 Turnstile 验证...")
-            try:
-                sb.uc_gui_click_captcha()
-                sb.sleep(6)
-            except Exception as e:
-                log(f"⚠️ Turnstile 点击异常: {e}")
 
-            # 提交登录
-            submit_ok = False
-            for sel in ('button[type="submit"]',
-                        'button:contains("Sign in")', 'button:contains("Login")',
-                        'button:contains("Se connecter")', 'button:contains("Connexion")'):
+            def _captcha_passed():
                 try:
-                    if sb.is_element_visible(sel):
-                        sb.click(sel)
-                        submit_ok = True
-                        log(f"✅ 已点击登录按钮: {sel}")
-                        break
+                    tok = sb.execute_script("""
+                        (function(){
+                            const el = document.querySelector(
+                                'textarea[name="cf-turnstile-response"], input[name="cf-turnstile-response"]');
+                            return !!(el && el.value && el.value.length > 10);
+                        })()
+                    """)
+                    if tok:
+                        return True
+                    pg = sb.get_page_source().lower()
+                    # 验证提示消失也视为通过
+                    return not any(k in pg for k in
+                                   ("i am not a robot", "captcha incorrect", "secured by aclclouds"))
                 except Exception:
-                    continue
-            if not submit_ok:
-                log("⚠️ 未找到登录提交按钮, 尝试回车提交")
+                    return False
+
+            turnstile_ok = False
+            for attempt in range(1, 5):
                 try:
-                    sb.enter()
+                    clicked = sb.uc_gui_click_captcha()
+                    log(f"   第 {attempt} 次点击验证框: {'已点击' if clicked else '未找到/无需点击'}")
+                except Exception as e:
+                    log(f"   ⚠️ 点击验证框异常: {e}")
+                sb.sleep(8)
+                if _captcha_passed():
+                    turnstile_ok = True
+                    log("✅ Turnstile 验证已通过 (响应 token 已生成)")
+                    break
+                log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试点击...")
+            if not turnstile_ok:
+                log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控)")
+                log("   → 确认 NODE_LINK / 本地代理是干净住宅 IP; 机房 IP 过不了 Turnstile")
+                try:
+                    sb.save_screenshot("acl_login_captcha_failed.png")
                 except Exception:
                     pass
+                return None
 
-            # 等待跳转离开登录页
+            # 提交登录 + 等待跳转 (验证码失败时自动重试一轮)
             logged_in = False
-            for _ in range(40):
-                url = sb.get_current_url()
-                if "auth/login" not in url and "login" not in url.lower():
-                    logged_in = True
+            for cycle in range(1, 3):
+                submit_ok = False
+                for sel in ('button[type="submit"]',
+                            'button:contains("Sign in")', 'button:contains("Login")',
+                            'button:contains("Se connecter")', 'button:contains("Connexion")'):
+                    try:
+                        if sb.is_element_visible(sel):
+                            sb.click(sel)
+                            submit_ok = True
+                            log(f"✅ 已点击登录按钮: {sel}")
+                            break
+                    except Exception:
+                        continue
+                if not submit_ok:
+                    log("⚠️ 未找到登录提交按钮, 尝试回车提交")
+                    try:
+                        sb.enter()
+                    except Exception:
+                        pass
+
+                # 等待跳转离开登录页
+                for _ in range(40):
+                    url = sb.get_current_url()
+                    if "auth/login" not in url and "login" not in url.lower():
+                        logged_in = True
+                        break
+                    sb.sleep(1)
+                if logged_in:
                     break
-                sb.sleep(1)
+
+                # 检查是否验证码错误, 是则重新点验证框再提交一轮
+                try:
+                    body = sb.get_text("body") or ""
+                except Exception:
+                    body = ""
+                if "captcha" in body.lower():
+                    log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新点击验证框并提交...")
+                    try:
+                        sb.uc_gui_click_captcha()
+                    except Exception:
+                        pass
+                    sb.sleep(7)
+                    continue
+                break
+
             if not logged_in:
                 log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
                 try:
