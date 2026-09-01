@@ -1,26 +1,45 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-ACLClouds 自动续期脚本 - 修复版本
-- 支持 dash.aclclouds.com (API 版)
-- 支持 aclclouds.com (浏览器版，带 Turnstile 处理)
-- 自动检测域名并选择对应模式
+ACLClouds 自动续期脚本 - 适配 2026-09 aclclouds.com 改版
+========================================================
+改版后关键变化 (均已适配):
+1. 面板从 dash.aclclouds.com 迁到 aclclouds.com/dashboard,
+   dash.aclclouds.com 所有请求 302 -> aclclouds.com。
+   => BASE_URL 必须指向 https://aclclouds.com
+   (否则 requests 跨域重定向时会丢弃手动注入的 Cookie 头 -> 401)
+2. 服务器响应新增字段: expires_at / can_renew / free_renewals_remaining /
+   free_renewals_max / plan.renewal_days / is_free / service_type
+3. 续期接口仍为 POST /api/client/servers/{id}/upgrade/renew
+   (未登录时返回 401 而非 404, 说明路由存在)
+4. 免费 Minecraft 提前 2 小时可续; 免费服务按周期(每4天/每6h等);
+   付费服务提前 4 天。
+
+用法:
+    export ACL_COOKIES="XSRF-TOKEN=...; __Host-aclclouds_session=..."
+    export TG_BOT_TOKEN=...  TG_CHAT_ID=...   # 可选
+    export DEBUG=1                             # 可选, 打印原始响应
+    python renew_fixed.py
 """
 
 import os
 import sys
 import json
 import time
+import re
 import urllib.parse
 from datetime import datetime, timezone
 
 import requests
 
 # ==================== 配置 ====================
-# 优先使用 dash.aclclouds.com (纯 API 版，无需浏览器)
-BASE_URL = os.environ.get("ACL_BASE_URL", "https://dash.aclclouds.com")
-RENEW_THRESHOLD_HOURS = int(os.environ.get("RENEW_THRESHOLD_HOURS", "48"))
+# 改版后 API 直接由 aclclouds.com 提供; 不要再指到 dash.aclclouds.com
+# (dash 会 302 到主域, 重定向时 Cookie 会被 requests 丢弃导致 401)
+BASE_URL = os.environ.get("ACL_BASE_URL", "https://aclclouds.com").rstrip("/")
+RENEW_THRESHOLD_HOURS = float(os.environ.get("RENEW_THRESHOLD_HOURS", "48"))
 
-# Cookie: 完整的浏览器 Cookie 字符串
+# Cookie: 完整的浏览器 Cookie 字符串, 必须来自 https://aclclouds.com
+# 至少包含 XSRF-TOKEN 和 __Host-aclclouds_session
 COOKIE = os.environ.get("ACL_COOKIES", "").strip()
 
 # 多账号支持 (可选), 格式: name1|||cookie1\nname2|||cookie2
@@ -30,10 +49,11 @@ MULTI_ACCOUNTS = os.environ.get("ACL_ACCOUNTS", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
-# 代理 (仅浏览器版需要)
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+# 调试: 打印每个请求的原始响应
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
 # ==================== 工具函数 ====================
@@ -43,6 +63,11 @@ def now_str():
 
 def log(msg):
     print(msg, flush=True)
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"  🐛 {msg}", flush=True)
 
 
 def send_tg(text):
@@ -89,13 +114,13 @@ def parse_iso(s):
         return None
 
 
-# ==================== API 版 (纯 HTTP) ====================
+# ==================== API 会话 (纯 HTTP) ====================
 def build_api_session(cookie_str):
-    """构建 API session，正确处理 __Host- 前缀 cookie
+    """构建 API session, 原样保留 __Host- 前缀 Cookie
 
-    关键修复: 不再用 s.cookies.set (requests 的 prepare_cookies 会用 cookiejar
-    覆盖手动设置的 Cookie header, 而且 __Host- 前缀会被剥离导致服务器不识别),
-    而是保存原始 Cookie 字符串, 在 api_get/api_post 里强制覆盖。
+    关键: 不再用 s.cookies.set (cookiejar 会剥离 __Host- 前缀,
+    且 prepare_cookies 会用剥离后的名字重建 Cookie 头导致服务器不识别),
+    而是保存原始字符串, 在每次请求时强制覆盖 Cookie 头。
     """
     s = requests.Session()
     s.headers.update({
@@ -103,61 +128,65 @@ def build_api_session(cookie_str):
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/projects",
+        "Referer": f"{BASE_URL}/dashboard",
     })
-    # 保存原始 Cookie 字符串（含 __Host- 前缀, 原样发送）
     s._raw_cookie = cookie_str.strip()
-    # 不写入 s.cookies, 防止 prepare_cookies 用剥离前缀的名字重建 header
     return s
 
 
 def get_xsrf(session):
-    """从原始 Cookie 字符串提取 XSRF-TOKEN (并 URL 解码)"""
+    """从原始 Cookie 字符串提取 XSRF-TOKEN (Laravel 加密值, URL 解码后放 header)"""
     raw = getattr(session, '_raw_cookie', '')
     if raw:
-        for kv in raw.split(";"):
-            kv = kv.strip()
-            if kv.startswith("XSRF-TOKEN="):
-                return urllib.parse.unquote(kv[len("XSRF-TOKEN="):])
+        m = re.search(r'(?:^|;\s*)XSRF-TOKEN=([^;]+)', raw)
+        if m:
+            return urllib.parse.unquote(m.group(1).strip())
     return None
 
 
-def api_get(session, path):
-    """发送 GET 请求，自动注入 XSRF token，并强制覆盖原始 Cookie"""
+def _send(session, method, path, payload=None):
+    """发送请求: 注入 X-XSRF-TOKEN 头 + 强制覆盖原始 Cookie 头"""
     headers = {}
     token = get_xsrf(session)
     if token:
         headers["X-XSRF-TOKEN"] = token
 
-    req = requests.Request('GET', f"{BASE_URL}{path}", headers=headers)
+    req = requests.Request(method, f"{BASE_URL}{path}",
+                           headers=headers, json=payload)
     prepared = session.prepare_request(req)
-    # 强制覆盖 Cookie header (prepare_cookies 已删掉手动 header, 这里写回原样)
+    # prepare_cookies 会删掉手动 Cookie 头, 这里写回原样 (含 __Host- 前缀)
     if getattr(session, '_raw_cookie', None):
         prepared.headers['Cookie'] = session._raw_cookie
-    return session.send(prepared, timeout=30)
+    r = session.send(prepared, timeout=30)
+
+    # 重定向防护: 如果响应 302 且跳去了别的域, Cookie 已被 requests 丢弃,
+    # 手动把 Location 和目标打出来, 方便定位"BASE_URL 指错域"问题
+    if r.is_redirect:
+        debug(f"{method} {path} -> 302 {r.headers.get('Location')} (重定向后 Cookie 会被丢弃, 检查 ACL_BASE_URL)")
+
+    debug(f"{method} {path} -> HTTP {r.status_code} | {r.text[:300]}")
+    return r
+
+
+def api_get(session, path):
+    return _send(session, "GET", path)
 
 
 def api_post(session, path, payload=None):
-    """发送 POST 请求，自动注入 XSRF token，并强制覆盖原始 Cookie"""
-    headers = {}
-    token = get_xsrf(session)
-    if token:
-        headers["X-XSRF-TOKEN"] = token
-
-    req = requests.Request('POST', f"{BASE_URL}{path}", headers=headers, json=payload or {})
-    prepared = session.prepare_request(req)
-    if getattr(session, '_raw_cookie', None):
-        prepared.headers['Cookie'] = session._raw_cookie
-    return session.send(prepared, timeout=30)
+    return _send(session, "POST", path, payload or {})
 
 
+# ==================== 数据解析 ====================
 def list_servers(session):
+    """拉取服务器列表 (改版后仍为 GET /api/client)"""
     r = api_get(session, "/api/client")
     if r.status_code == 401:
-        log(f"❌ 登录失败 (401): Cookie 已过期，请重新获取")
-        log(f"   响应: {r.text[:200]}")
+        log(f"❌ 登录失败 (401): Cookie 无效或过期")
+        log(f"   请重新登录 https://aclclouds.com/dashboard 并复制新 Cookie")
         return []
-    r.raise_for_status()
+    if r.status_code != 200:
+        log(f"❌ /api/client 返回 HTTP {r.status_code}: {r.text[:300]}")
+        return []
     j = r.json()
     if isinstance(j, dict):
         return j.get("data", [])
@@ -167,6 +196,7 @@ def list_servers(session):
 def server_detail(session, sid):
     r = api_get(session, f"/api/client/servers/{sid}")
     if r.status_code != 200:
+        debug(f"server_detail {sid} -> HTTP {r.status_code}")
         return None
     try:
         j = r.json()
@@ -175,9 +205,32 @@ def server_detail(session, sid):
         return None
 
 
+def extract_server_id(attrs):
+    """提取续期接口需要的短标识 (Pterodactyl 短 id = uuid 前 8 位)
+
+    改版后 attributes 里可能只有 uuid (完整 UUID), 直接用完整 UUID 调
+    /api/client/servers/{id} 会得到 404, 这里自动截取前 8 位。
+    """
+    if not isinstance(attrs, dict):
+        return None
+    for k in ("identifier", "uuid_short", "short_uuid", "server_id"):
+        v = attrs.get(k)
+        if v:
+            return str(v)
+    u = attrs.get("uuid") or attrs.get("id")
+    if u:
+        u = str(u)
+        if "-" in u:          # 完整 UUID 形如 xxxxxxxx-xxxx-...
+            return u.split("-")[0]
+        return u[:8]
+    return None
+
+
 def find_expire(attrs, detail=None):
-    """从多个可能字段找到期时间"""
-    candidates = [attrs]
+    """从多个可能字段找到期时间 (改版后主字段为 expires_at)"""
+    candidates = []
+    if attrs:
+        candidates.append(attrs)
     if detail:
         candidates.append(detail)
     for c in list(candidates):
@@ -195,33 +248,67 @@ def find_expire(attrs, detail=None):
     return None, None
 
 
+def renewal_availability(attrs, detail=None):
+    """读取改版后的续期状态字段
+
+    返回 (can_renew, free_remaining, reason):
+      - can_renew: True/False/None(旧结构, 无此字段)
+      - free_remaining: 剩余免费续期次数 (可能为 None)
+      - reason: 不可续期的原因文本
+    """
+    for c in (attrs, detail):
+        if not isinstance(c, dict):
+            continue
+        if c.get("can_renew") is not None:
+            can = bool(c.get("can_renew"))
+            free = c.get("free_renewals_remaining")
+            reason = None
+            if not can:
+                if free == 0:
+                    reason = "免费续期次数已用完"
+                else:
+                    reason = "面板标记暂不可续期 (can_renew=false)"
+            return can, free, reason
+    return None, None, None
+
+
 def renew_server_api(session, sid):
-    """调用续期 API"""
+    """调用续期接口 (路由已确认仍存在)"""
     r = api_post(session, f"/api/client/servers/{sid}/upgrade/renew")
     captcha_required = False
     if r.status_code == 403:
+        body = r.text
         try:
             j = r.json()
-            if isinstance(j, dict) and j.get("code") == "captcha_required":
+            code = j.get("code") if isinstance(j, dict) else None
+            if code == "captcha_required" or "captcha" in body.lower():
                 captcha_required = True
         except Exception:
-            pass
+            if "captcha" in body.lower():
+                captcha_required = True
     return r, captcha_required
 
 
-# ==================== 浏览器版 (需要 Turnstile) ====================
-def check_browser_requirements():
-    """检查浏览器环境"""
+def renew_error_msg(r):
+    """从续期响应中提取后端错误 (可能 2xx 但 body 带错误, 如 renewNotAvailableYet)"""
     try:
-        from seleniumbase import Driver
-        return True, Driver
-    except ImportError:
-        return False, None
+        j = r.json()
+    except Exception:
+        return None
+    if not isinstance(j, dict):
+        return None
+    # Pterodactyl/Laravel 错误格式: { errors: [ { code, detail } ] }
+    errors = j.get("errors")
+    if isinstance(errors, list) and errors:
+        e = errors[0]
+        return f"{e.get('code', '')}: {e.get('detail', '')}".strip(": ")
+    if j.get("code"):
+        return f"{j.get('code')}: {j.get('detail', '')}".strip(": ")
+    return None
 
 
-# ==================== 主流程 ====================
-def process_account(label, cookie_str, use_browser=False):
-    """处理单个账号的续期"""
+# ==================== 单账号续期流程 ====================
+def process_account(label, cookie_str):
     log(f"\n{'='*60}")
     log(f"👤 账号: {label}")
     log(f"🌐 站点: {BASE_URL}")
@@ -230,126 +317,183 @@ def process_account(label, cookie_str, use_browser=False):
     if not cookie_str:
         return {"label": label, "ok": False, "msg": "Cookie 为空", "renewed": 0, "failed": 0}
 
-    # 构建 session
+    # 友好提示: Cookie 里的 __Host- 域名与 BASE_URL 是否匹配
+    if "dash.aclclouds.com" in BASE_URL:
+        log("⚠️ ACL_BASE_URL 指向 dash.aclclouds.com, 该域名现已 302 到 aclclouds.com")
+        log("   (重定向会丢 Cookie 导致 401), 建议改回 https://aclclouds.com")
+
     session = build_api_session(cookie_str)
 
-    # 1. 测试登录
+    # 1. 登录自检
     try:
         test_r = api_get(session, "/api/client")
-        if test_r.status_code == 200:
-            log("✅ API 登录验证通过")
-        else:
-            log(f"❌ 登录失败: HTTP {test_r.status_code}")
-            log(f"   响应: {test_r.text[:300]}")
-            return {"label": label, "ok": False, "msg": f"登录失败 HTTP {test_r.status_code}", "renewed": 0, "failed": 0}
     except Exception as e:
-        log(f"❌ 登录测试异常: {e}")
-        return {"label": label, "ok": False, "msg": f"登录异常: {e}", "renewed": 0, "failed": 0}
+        log(f"❌ 网络异常: {e}")
+        return {"label": label, "ok": False, "msg": f"网络异常: {e}", "renewed": 0, "failed": 0}
 
-    # 2. 获取服务器列表
+    if test_r.status_code == 200:
+        log("✅ API 登录验证通过")
+    elif test_r.status_code == 401:
+        log("❌ 登录失败: HTTP 401")
+        log("   原因排查:")
+        log("   1) Cookie 过期 -> 重新登录 https://aclclouds.com/dashboard 复制新 Cookie")
+        log("   2) Cookie 是从 dash.aclclouds.com 复制的旧会话 -> 必须从 aclclouds.com 复制")
+        log("   3) ACL_BASE_URL 指向了 dash.aclclouds.com -> 改回 https://aclclouds.com")
+        log(f"   响应: {test_r.text[:300]}")
+        return {"label": label, "ok": False, "msg": "登录失败 HTTP 401 (Cookie 无效/过期/域名不匹配)", "renewed": 0, "failed": 0}
+    elif test_r.status_code == 403:
+        log("❌ 登录失败: HTTP 403")
+        log("   IP 被 Cloudflare 风控或需要 Turnstile 验证 (本机/数据中心 IP 常见)")
+        return {"label": label, "ok": False, "msg": "登录失败 HTTP 403 (CF 风控/Turnstile)", "renewed": 0, "failed": 0}
+    else:
+        log(f"❌ 登录失败: HTTP {test_r.status_code}")
+        log(f"   响应: {test_r.text[:300]}")
+        return {"label": label, "ok": False, "msg": f"登录失败 HTTP {test_r.status_code}", "renewed": 0, "failed": 0}
+
+    # 2. 拉取服务器列表
     servers = list_servers(session)
     if not servers:
-        return {"label": label, "ok": True, "msg": "无服务器或获取失败", "renewed": 0, "failed": 0}
+        log("📦 没有服务器")
+        return {"label": label, "ok": True, "msg": "无服务器", "renewed": 0, "failed": 0}
 
     log(f"📦 共 {len(servers)} 台服务器")
+    if servers:
+        first = servers[0]
+        attrs = first.get("attributes", first) if isinstance(first, dict) else {}
+        debug(f"首台服务器字段: {list(attrs.keys()) if isinstance(attrs, dict) else type(attrs).__name__}")
 
-    # 3. 筛选需要续期的服务器
     now = datetime.now(timezone.utc)
     to_renew = []
-    
-    for srv in servers:
+    skipped = []
+
+    for idx, srv in enumerate(servers, 1):
         attrs = srv.get("attributes", srv) if isinstance(srv, dict) else {}
-        sid = attrs.get("identifier") or attrs.get("id") or attrs.get("uuid")
-        name = attrs.get("name", f"server-{len(to_renew)+1}")
-        
+        sid = extract_server_id(attrs)
+        name = attrs.get("name", f"server-{idx}")
         if not sid:
+            debug(f"{name}: 缺少 server id, attrs keys={list(attrs.keys()) if isinstance(attrs, dict) else '?'}")
+            skipped.append(f"⚠️ {name}: 缺少 server id")
             continue
-            
-        # 获取详情和到期时间
+
+        # 到期时间 (列表没有则拉详情)
         _, expire_str = find_expire(attrs)
         detail = None
         if not expire_str:
             detail = server_detail(session, sid)
             if detail:
                 _, expire_str = find_expire(attrs, detail)
-        
-        if not expire_str:
+
+        # 改版后的续期状态字段
+        can_renew, free_left, reason = renewal_availability(attrs, detail)
+        if can_renew is False:
+            log(f"  ⏭️ {name}: {reason or '不可续期'}")
+            skipped.append(f"⏭️ {name}: {reason or '不可续期'}")
             continue
-            
+        if can_renew is True and free_left == 0:
+            log(f"  ⏭️ {name}: 免费续期次数已用完 (free_renewals_remaining=0)")
+            skipped.append(f"⏭️ {name}: 免费续期次数已用完")
+            continue
+
+        if not expire_str:
+            log(f"  ⏭️ {name}: 无到期时间字段 (attrs keys 见 DEBUG=1)")
+            skipped.append(f"⚠️ {name}: 无到期时间字段")
+            continue
+
         expire = parse_iso(expire_str)
         if not expire:
+            log(f"  ⏭️ {name}: 到期时间格式错误 ({expire_str})")
+            skipped.append(f"⚠️ {name}: 到期时间格式错误")
             continue
-            
+
         remaining = (expire - now).total_seconds()
         remaining_h = remaining / 3600
-        
-        log(f"  - {name}: 剩余 {fmt_remaining(remaining)} ({remaining_h:.1f}h)")
-        
+        log(f"  - {name}: 到期 {expire_str} | 剩余 {fmt_remaining(remaining)} ({remaining_h:.1f}h)"
+            + (f" | 免费续期余 {free_left}" if free_left is not None else ""))
+
         if remaining_h < RENEW_THRESHOLD_HOURS:
             to_renew.append({"id": sid, "name": name, "remaining": remaining})
+        else:
+            skipped.append(f"⏭️ {name}: 剩 {fmt_remaining(remaining)}, 未到阈值 {RENEW_THRESHOLD_HOURS:g}h")
 
     if not to_renew:
-        return {"label": label, "ok": True, "msg": f"所有服务器剩余时间充足，无需续期", "renewed": 0, "failed": 0}
+        msg = f"所有服务器剩余时间充足, 无需续期" if not skipped else f"无需续期 ({len(skipped)} 台跳过)"
+        log(f"ℹ️ {msg}")
+        return {"label": label, "ok": True, "msg": msg, "renewed": 0, "failed": 0, "results": skipped}
 
     log(f"🔄 需要续期 {len(to_renew)} 台服务器")
 
-    # 4. 执行续期
+    # 3. 执行续期
     renewed = 0
     failed = 0
-    results = []
-    
+    results = list(skipped)
+
     for srv in to_renew:
         log(f"\n🖥️ 续期: {srv['name']} (id={srv['id']})")
-        
         try:
             r, captcha = renew_server_api(session, srv["id"])
-            
-            if r.status_code in (200, 201, 202, 204):
-                # 续期成功，重新查询到期时间
-                time.sleep(1.5)
-                new_detail = server_detail(session, srv["id"])
-                _, new_expire_str = find_expire({}, new_detail)
-                new_expire = parse_iso(new_expire_str) if new_expire_str else None
-                
-                if new_expire:
-                    new_remaining = (new_expire - now).total_seconds()
-                    results.append(f"✅ {srv['name']}: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
-                else:
-                    results.append(f"✅ {srv['name']}: 续期成功")
-                renewed += 1
-                log(f"✅ 续期成功")
-                
-            elif captcha:
+
+            if r.status_code == 404:
+                # 大概率是 id 类型不对 (完整 uuid 而非短标识)
+                log(f"❌ HTTP 404: 服务器 id 可能不是短标识 ({srv['id']})")
+                results.append(f"❌ {srv['name']}: 404 (id 格式问题)")
+                failed += 1
+            elif r.status_code == 401:
+                log(f"❌ HTTP 401: 会话失效, 本次不再继续")
+                results.append(f"❌ {srv['name']}: 401 会话失效")
+                failed += 1
+                break
+            elif r.status_code == 403 and captcha:
+                log(f"🛡️ 需要 Turnstile 验证 (纯 API 无法通过, 跳过)")
                 results.append(f"🛡️ {srv['name']}: 需要 Turnstile 验证")
                 failed += 1
-                log(f"🛡️ 需要浏览器验证")
-                
+            elif r.status_code in (200, 201, 202, 204):
+                # 2xx 也可能 body 带错误 (如 renewNotAvailableYet)
+                err = renew_error_msg(r)
+                if err:
+                    log(f"⏭️ 后端拒绝: {err}")
+                    results.append(f"⏭️ {srv['name']}: {err}")
+                    # 未真正续期, 但也不算失败
+                else:
+                    time.sleep(1.5)
+                    new_detail = server_detail(session, srv["id"])
+                    _, new_expire_str = find_expire({}, new_detail)
+                    new_expire = parse_iso(new_expire_str) if new_expire_str else None
+                    if new_expire:
+                        new_remaining = (new_expire - now).total_seconds()
+                        results.append(f"✅ {srv['name']}: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
+                        log(f"✅ 续期成功: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
+                    else:
+                        results.append(f"✅ {srv['name']}: 续期成功")
+                        log(f"✅ 续期成功")
+                    renewed += 1
             else:
-                results.append(f"❌ {srv['name']}: HTTP {r.status_code} - {r.text[:100]}")
+                body = r.text[:200]
+                err = renew_error_msg(r)
+                results.append(f"❌ {srv['name']}: HTTP {r.status_code} {err or body}")
                 failed += 1
-                log(f"❌ 续期失败: HTTP {r.status_code}")
-                
+                log(f"❌ 续期失败: HTTP {r.status_code} {err or body}")
         except Exception as e:
             results.append(f"❌ {srv['name']}: {e}")
             failed += 1
             log(f"❌ 异常: {e}")
-        
+
         time.sleep(2)
 
     return {
         "label": label,
         "ok": failed == 0,
-        "msg": f"成功 {renewed} 台，失败 {failed} 台",
+        "msg": f"成功 {renewed} 台, 失败 {failed} 台",
         "renewed": renewed,
         "failed": failed,
         "results": results,
     }
 
 
+# ==================== 主入口 ====================
 def collect_accounts():
-    """收集账号列表"""
+    """返回 [(label, cookie_str), ...]"""
     accounts = []
-    
+
     if MULTI_ACCOUNTS:
         for line in MULTI_ACCOUNTS.splitlines():
             line = line.strip()
@@ -360,17 +504,16 @@ def collect_accounts():
                 accounts.append((name.strip(), ck.strip()))
             else:
                 accounts.append((f"account-{len(accounts)+1}", line))
-    
+
     if not accounts and COOKIE:
         accounts.append(("main", COOKIE))
-    
+
     return accounts
 
 
 def build_summary(all_results):
-    """构建汇总消息"""
+    """构建 TG 汇总消息"""
     renewed_total = sum(r.get("renewed", 0) for r in all_results)
-    skipped_total = sum(r.get("skipped", 0) for r in all_results)
     failed_total = sum(r.get("failed", 0) for r in all_results)
 
     lines = ["🎮 *ACLClouds 自动续期*", f"⏰ {now_str()}", ""]
@@ -382,7 +525,7 @@ def build_summary(all_results):
             lines.append(f"👤 {r['label']}: ❌ {r.get('msg', '失败')}")
         else:
             lines.append(f"👤 {r['label']}: ✅ {r.get('msg', '成功')}")
-            if "results" in r:
+            if r.get("results"):
                 for res in r["results"]:
                     lines.append(f"  {res}")
         lines.append("")
@@ -392,12 +535,19 @@ def build_summary(all_results):
 
 def main():
     log(f"🚀 ACLClouds 续期脚本启动 @ {now_str()}")
-    log(f"⚙️ 站点: {BASE_URL}")
-    log(f"⏰ 续期阈值: {RENEW_THRESHOLD_HOURS}h")
+    log(f"🌐 站点: {BASE_URL}")
+    log(f"⏰ 续期阈值: {RENEW_THRESHOLD_HOURS:g}h")
+
+    if "dash.aclclouds.com" in BASE_URL:
+        log("⚠️ 检测到 ACL_BASE_URL=dash.aclclouds.com, 该域名已废弃(302->aclclouds.com)")
+        log("  请使用: export ACL_BASE_URL=https://aclclouds.com")
 
     accounts = collect_accounts()
     if not accounts:
-        msg = "❌ 未配置 ACL_COOKIES 或 ACL_ACCOUNTS\n\n请使用以下环境变量之一：\n- ACL_COOKIES: 单账号 Cookie\n- ACL_ACCOUNTS: 多账号 (格式: name|||cookie)"
+        msg = ("❌ 未配置 ACL_COOKIES 或 ACL_ACCOUNTS\n\n"
+               "请使用以下环境变量之一:\n"
+               "- ACL_COOKIES: 单账号 Cookie (来自 https://aclclouds.com)\n"
+               "- ACL_ACCOUNTS: 多账号 (格式: name|||cookie)")
         log(msg)
         send_tg(msg)
         sys.exit(1)
@@ -426,4 +576,3 @@ if __name__ == "__main__":
         log(f"💥 未捕获异常: {e}")
         send_tg(f"🎮 ACLClouds 续期\n\n💥 脚本崩溃: {e}")
         sys.exit(1)
-
