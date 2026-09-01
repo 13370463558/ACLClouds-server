@@ -33,11 +33,16 @@
 
 | Secret 名称 | 必填 | 说明 |
 | --- | --- | --- |
-| `ACL_COOKIES` | XSRF-TOKEN=<浏览器里的值>; __Host-aclclouds_session=<你贴的这个值>
+| `ACL_COOKIES` | ✅ 兜底 | 单账号 Cookie, 格式: `XSRF-TOKEN=<值>; __Host-aclclouds_session=<值>` |
 | `ACL_ACCOUNTS` | 多账号 | 格式: `name1\|\|\|cookie1\nname2\|\|\|cookie2` (每行一个) |
+| `ACL_EMAIL` + `ACL_PASSWORD` | 免换Cookie | aclclouds 登录邮箱/密码, 开启**浏览器自动登录** |
+| `NODE_LINK` | 浏览器登录 | 住宅/原生代理节点 (过 Turnstile 需要干净 IP) |
+| `GH_TOKEN` | 自动更新 | GitHub PAT, 登录后自动把新 Cookie 写回 `ACL_COOKIES` |
 | `TG_BOT_TOKEN` | TG 通知 | Telegram Bot Token |
 | `TG_CHAT_ID` | TG 通知 | 接收通知的 Chat ID |
-> `ACL_ACCOUNTS` 和 `ACL_COOKIES` 二选一, 同时配置时 `ACL_ACCOUNTS` 优先
+
+> 登录优先级: 有 `ACL_COOKIES` 先用 API (快, 不启浏览器); 若 401 且配置了 `ACL_EMAIL`/`ACL_PASSWORD`,
+> 自动用浏览器登录重试续期, 成功后经 `GH_TOKEN` 更新 Secret —— **之后不用再手动换 Cookie**。
 
 ### 4. 手动测试
 

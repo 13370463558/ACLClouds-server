@@ -1,4 +1,4 @@
-﻿name: AclClouds-卡卡自动续期
+name: AclClouds-卡卡自动续期
 
 on:
   schedule:
@@ -12,7 +12,7 @@ permissions:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: 检出代码
@@ -23,16 +23,27 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安装依赖
+      - name: 安装依赖 (含 seleniumbase, 用于浏览器自动登录)
         run: |
           pip install -r requirements.txt
+          seleniumbase install chromedriver || true
+
+      - name: 设置代理 (sing-box, 供浏览器过 Turnstile)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 执行续期
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
           ACL_ACCOUNTS: ${{ secrets.ACL_ACCOUNTS }}
+          ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
+          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+          IS_PROXY: "true"
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        # 注意: 必须用 renew_fixed.py (修复 __Host- Cookie 前缀被剥离导致 401 的 bug)
-        # 旧版 renew.py 会 401 但仍 exit 0, 造成"假成功"
+        # renew_fixed.py: Cookie 登录优先; 401 或配置了账密时走浏览器自动登录
         run: python renew_fixed.py

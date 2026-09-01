@@ -52,6 +52,17 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 # 调试: 打印每个请求的原始响应
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
+# ==================== 浏览器自动登录 (可选, 免手动换 Cookie) ====================
+# 配置 ACL_EMAIL + ACL_PASSWORD 后, Cookie 过期时脚本会用浏览器自动登录
+# (过 Turnstile 需要干净代理, 与 bot-hosting 方案一致)
+ACL_EMAIL = os.environ.get("ACL_EMAIL", "").strip()
+ACL_PASSWORD = os.environ.get("ACL_PASSWORD", "").strip()
+IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
+HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
+GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()          # 自动更新 ACL_COOKIES Secret
+GH_REPO = os.environ.get("GH_REPO", "weikkadd/ACLClouds-server").strip()
+
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -359,6 +370,189 @@ def renew_error_msg(r):
     return None
 
 
+# ==================== 浏览器自动登录 (SeleniumBase, 免手动换 Cookie) ====================
+def _dump_login_form(sb):
+    """诊断: 打印登录页可见的表单元素"""
+    try:
+        els = sb.execute_script("""
+            (function(){
+                return Array.from(document.querySelectorAll('input,button'))
+                    .filter(el => el.offsetParent !== null)
+                    .map(el => el.tagName + '|name=' + (el.getAttribute('name')||'')
+                          + '|type=' + (el.getAttribute('type')||'')
+                          + '|ph=' + (el.getAttribute('placeholder')||'')
+                          + '|' + ((el.innerText||el.textContent||'').trim().slice(0,25)))
+                    .slice(0, 25);
+            })()
+        """)
+        print("🔍 登录表单元素:")
+        for x in els or []:
+            print("   ", x)
+    except Exception as e:
+        print(f"⚠️ 枚举登录表单失败: {e}")
+
+
+def browser_login():
+    """用浏览器登录 aclclouds.com, 返回 Cookie 字符串; 失败返回 None
+
+    流程: 打开 /auth/login → 填账密 → 过 Turnstile → 提交 → 等跳转 → 取 cookie
+    需要: pip install seleniumbase; 过 Turnstile 需要干净代理 (IS_PROXY=true)。
+    """
+    if not ACL_EMAIL or not ACL_PASSWORD:
+        log("ℹ️ 未配置 ACL_EMAIL/ACL_PASSWORD, 跳过浏览器自动登录")
+        return None
+    try:
+        from seleniumbase import SB
+    except ImportError:
+        log("❌ 未安装 seleniumbase, 无法浏览器登录 (pip install seleniumbase)")
+        return None
+
+    kwargs = {"uc": True, "headless": HEADLESS}
+    if IS_PROXY:
+        log(f"🔗 浏览器走代理: {PROXY_SERVER}")
+        kwargs["proxy"] = PROXY_SERVER
+    else:
+        log("🌐 浏览器直连 (Turnstile 过不去时请设 IS_PROXY=true + 干净代理)")
+
+    log("🚀 启动浏览器登录 aclclouds.com ...")
+    try:
+        with SB(**kwargs) as sb:
+            sb.open("https://aclclouds.com/auth/login")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(3)
+            log(f"📝 当前 URL: {sb.get_current_url()}")
+            _dump_login_form(sb)
+
+            # 填邮箱
+            email_filled = False
+            for sel in ('input[name="email"]', 'input[type="email"]',
+                        'input[autocomplete="email"]', 'input[placeholder*="example.com"]'):
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.type(sel, ACL_EMAIL)
+                        email_filled = True
+                        log(f"✅ 已填写邮箱: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            # 填密码
+            pw_filled = False
+            for sel in ('input[name="password"]', 'input[type="password"]',
+                        'input[autocomplete="current-password"]'):
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.type(sel, ACL_PASSWORD)
+                        pw_filled = True
+                        log(f"✅ 已填写密码: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if not (email_filled and pw_filled):
+                log("❌ 未找到邮箱/密码输入框 (表单结构可能已变)")
+                _dump_login_form(sb)
+                try:
+                    sb.save_screenshot("acl_login_form.png")
+                except Exception:
+                    pass
+                return None
+
+            # Turnstile
+            log("🔒 尝试通过 Turnstile 验证...")
+            try:
+                sb.uc_gui_click_captcha()
+                sb.sleep(6)
+            except Exception as e:
+                log(f"⚠️ Turnstile 点击异常: {e}")
+
+            # 提交登录
+            submit_ok = False
+            for sel in ('button[type="submit"]',
+                        'button:contains("Sign in")', 'button:contains("Login")',
+                        'button:contains("Se connecter")', 'button:contains("Connexion")'):
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        submit_ok = True
+                        log(f"✅ 已点击登录按钮: {sel}")
+                        break
+                except Exception:
+                    continue
+            if not submit_ok:
+                log("⚠️ 未找到登录提交按钮, 尝试回车提交")
+                try:
+                    sb.enter()
+                except Exception:
+                    pass
+
+            # 等待跳转离开登录页
+            logged_in = False
+            for _ in range(40):
+                url = sb.get_current_url()
+                if "auth/login" not in url and "login" not in url.lower():
+                    logged_in = True
+                    break
+                sb.sleep(1)
+            if not logged_in:
+                log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
+                try:
+                    print("   📝 页面内容:", sb.get_text("body")[:300])
+                except Exception:
+                    pass
+                try:
+                    sb.save_screenshot("acl_login_failed.png")
+                except Exception:
+                    pass
+                return None
+
+            log(f"✅ 登录成功, 当前页面: {sb.get_current_url()}")
+
+            # 提取 cookie
+            cookies = sb.get_cookies()
+            xsrf = session = None
+            for c in cookies:
+                if c.get("name") == "XSRF-TOKEN":
+                    xsrf = c.get("value")
+                if c.get("name") == "__Host-aclclouds_session":
+                    session = c.get("value")
+            if not (xsrf and session):
+                log("❌ 登录成功但未拿到 XSRF-TOKEN/__Host-aclclouds_session")
+                print("   cookie 名:", [c.get("name") for c in cookies])
+                return None
+            cookie = f"XSRF-TOKEN={xsrf}; __Host-aclclouds_session={session}"
+            log(f"✅ 浏览器登录完成, 已获取新 Cookie (session 前 8 位: {session[:8]}...)")
+            return cookie
+    except Exception as e:
+        log(f"💥 浏览器登录异常: {e}")
+        return None
+
+
+def update_acl_secret(cookie_str):
+    """用 gh CLI 把新 Cookie 写回 GitHub Secret ACL_COOKIES (Actions 里 gh 已认证)"""
+    if not GH_TOKEN:
+        log("ℹ️ 未配置 GH_TOKEN, 不更新 GitHub Secret (本地下次仍需浏览器登录)")
+        return False
+    import subprocess
+    masked = (cookie_str[:20] + "..." + cookie_str[-10:]) if len(cookie_str) > 30 else "***"
+    log(f"🔄 更新 Secret ACL_COOKIES (新值: {masked})")
+    try:
+        env = os.environ.copy()
+        env["GH_TOKEN"] = GH_TOKEN
+        proc = subprocess.run(
+            ["gh", "secret", "set", "ACL_COOKIES", "--repo", GH_REPO, "--body", cookie_str],
+            capture_output=True, text=True, timeout=60, check=False, env=env,
+        )
+        if proc.returncode == 0:
+            log("✅ ACL_COOKIES 更新成功")
+            return True
+        log(f"❌ 更新失败: {proc.stderr.strip()[:200]}")
+        return False
+    except Exception as e:
+        log(f"❌ 更新 Secret 异常: {e}")
+        return False
+
+
 # ==================== 单账号续期流程 ====================
 def process_account(label, cookie_str):
     log(f"\n{'='*60}")
@@ -605,11 +799,30 @@ def main():
         log("  请使用: export ACL_BASE_URL=https://aclclouds.com")
 
     accounts = collect_accounts()
+
+    # 没有 Cookie 但有账密 → 直接用浏览器登录获取
+    if not accounts and ACL_EMAIL and ACL_PASSWORD:
+        log("🔑 未配置 Cookie, 尝试浏览器自动登录...")
+        fresh = browser_login()
+        if fresh:
+            accounts = [("main", fresh)]
+            log("✅ 浏览器登录成功, 使用新 Cookie 执行续期")
+        else:
+            msg = ("❌ 浏览器登录失败\n\n"
+                   "请检查:\n"
+                   "- ACL_EMAIL/ACL_PASSWORD 是否正确\n"
+                   "- 代理能否过 Turnstile (IS_PROXY=true + 干净代理)\n"
+                   "- 是否触发 2FA (需手动处理)")
+            log(msg)
+            send_tg(msg)
+            sys.exit(1)
+
     if not accounts:
-        msg = ("❌ 未配置 ACL_COOKIES 或 ACL_ACCOUNTS\n\n"
+        msg = ("❌ 未配置 ACL_COOKIES / ACL_ACCOUNTS / (ACL_EMAIL+ACL_PASSWORD)\n\n"
                "请使用以下环境变量之一:\n"
                "- ACL_COOKIES: 单账号 Cookie (来自 https://aclclouds.com)\n"
-               "- ACL_ACCOUNTS: 多账号 (格式: name|||cookie)")
+               "- ACL_ACCOUNTS: 多账号 (格式: name|||cookie)\n"
+               "- ACL_EMAIL + ACL_PASSWORD: 浏览器自动登录 (免手动换 Cookie)")
         log(msg)
         send_tg(msg)
         sys.exit(1)
@@ -620,6 +833,17 @@ def main():
     for label, ck in accounts:
         try:
             res = process_account(label, ck)
+            # Cookie 登录 401 且有账密 → 浏览器自动登录重试 (免手动换 Cookie)
+            if (not res.get("ok")) and ACL_EMAIL and ACL_PASSWORD and "401" in str(res.get("msg", "")):
+                log("🔑 Cookie 登录 401, 尝试浏览器自动登录重试...")
+                fresh = browser_login()
+                if fresh:
+                    log("✅ 浏览器登录成功, 用新 Cookie 重试续期")
+                    res = process_account(label, fresh)
+                    if GH_TOKEN:
+                        update_acl_secret(fresh)
+                else:
+                    log("⚠️ 浏览器登录失败, 维持 401 结果")
         except Exception as e:
             res = {"label": label, "ok": False, "msg": f"异常: {e}", "renewed": 0, "failed": 1}
         all_results.append(res)
