@@ -479,7 +479,8 @@ def _discord_oauth_login(sb):
             return None
         log(f"   client_id={client_id} | redirect={redirect_uri[:60]} | scope={scope or '(默认)'}")
 
-        # 3) 用 Discord token 请求授权, 拿带 code 的回调 URL (bot-hosting 同款)
+        # 3) 用 Discord token 请求授权, 拿带 code 的回调 URL
+        #    GET 若返回 200 (同意授权页) 则改 POST 自动授权 (authorize:true)
         disc_url = ("https://discord.com/api/v9/oauth2/authorize?"
                     + urllib.parse.urlencode({
                         "client_id": client_id,
@@ -488,25 +489,49 @@ def _discord_oauth_login(sb):
                         "scope": scope or "identify email guilds",
                         "state": state,
                     }))
+        dheaders = {
+            "Authorization": DISCORD_TOKEN,
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"),
+        }
+
+        def _disc_authorize(method="GET"):
+            if method == "POST":
+                payload = {
+                    "permissions": "0",
+                    "authorize": True,
+                    "integration_type": 0,
+                    "client_id": client_id,
+                    "response_type": "code",
+                    "redirect_uri": redirect_uri,
+                    "scope": scope or "identify email guilds",
+                    "state": state,
+                }
+                return requests.post(disc_url, headers={**dheaders, "Content-Type": "application/json"},
+                                     json=payload, allow_redirects=False, timeout=25)
+            return requests.get(disc_url, headers=dheaders, allow_redirects=False, timeout=25)
+
         try:
-            resp = requests.get(
-                disc_url,
-                headers={
-                    "Authorization": DISCORD_TOKEN,
-                    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"),
-                },
-                allow_redirects=False, timeout=20,
-            )
+            resp = _disc_authorize("GET")
+            if resp.status_code not in (301, 302):
+                log(f"ℹ️ GET 授权返回 HTTP {resp.status_code} (可能需要同意授权), 尝试 POST 自动授权...")
+                resp = _disc_authorize("POST")
         except Exception as e:
             log(f"❌ Discord 授权请求异常: {e}")
             return None
-        if resp.status_code not in (301, 302):
-            log(f"❌ Discord 授权失败: HTTP {resp.status_code} - {resp.text[:150]}")
-            return None
-        callback = resp.headers.get("Location", "")
+
+        callback = ""
+        if resp.status_code in (301, 302):
+            callback = resp.headers.get("Location", "")
+        else:
+            # 个别情况下 200 响应体里带 location 字段
+            try:
+                j = resp.json()
+                callback = j.get("location") or ""
+            except Exception:
+                callback = ""
         if not callback:
-            log("❌ 授权响应无 Location")
+            log(f"❌ Discord 授权失败: HTTP {resp.status_code} - {resp.text[:200]}")
             return None
         log(f"✅ 拿到回调 URL: {re.sub(r'code=[^&]+', 'code=***', callback)[:120]}")
 
