@@ -71,16 +71,36 @@ def debug(msg):
 
 
 def send_tg(text):
+    """发送 TG 通知; 返回是否成功"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
+        log("ℹ️ 未配置 TG_BOT_TOKEN / TG_CHAT_ID, 已跳过 TG 通知")
+        log("   GitHub Actions: Settings → Secrets and variables → Actions 添加这两个 secret")
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"},
             timeout=15,
         )
+        if r.status_code == 200:
+            log("📨 TG 通知已发送")
+            return True
+        # Markdown 解析失败 (消息里含未转义字符) 时去掉 parse_mode 重试
+        log(f"⚠️ TG Markdown 发送失败 HTTP {r.status_code}: {r.text[:150]}")
+        log("   改用纯文本重试")
+        r2 = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=15,
+        )
+        if r2.status_code == 200:
+            log("📨 TG 通知已发送 (纯文本)")
+            return True
+        log(f"❌ TG 发送失败 HTTP {r2.status_code}: {r2.text[:200]}")
+        return False
     except Exception as e:
-        log(f"⚠️ TG 推送失败: {e}")
+        log(f"⚠️ TG 推送异常: {e}")
+        return False
 
 
 def fmt_remaining(seconds):
