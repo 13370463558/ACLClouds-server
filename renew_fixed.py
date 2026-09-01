@@ -57,6 +57,8 @@ DEBUG = os.environ.get("DEBUG", "0") == "1"
 # (过 Turnstile 需要干净代理, 与 bot-hosting 方案一致)
 ACL_EMAIL = os.environ.get("ACL_EMAIL", "").strip()
 ACL_PASSWORD = os.environ.get("ACL_PASSWORD", "").strip()
+# Discord OAuth 回退登录 (账号需绑定 Discord; Turnstile 组件加载不出时自动使用)
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
 HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
@@ -423,6 +425,130 @@ def _click_turnstile(sb):
     return False
 
 
+def _discord_oauth_login(sb):
+    """Discord OAuth 登录回退 (账号需绑定 Discord; Turnstile 不可用时自动使用)
+
+    流程: 点登录页 Discord 按钮 → 抓 authorize URL (client_id/state/redirect_uri)
+    → 用 Discord token 完成授权拿 code → 浏览器打开回调 → 提取 cookie。
+    """
+    if not DISCORD_TOKEN:
+        log("ℹ️ 未配置 DISCORD_TOKEN, 跳过 Discord OAuth 回退")
+        return None
+    log("🔑 尝试 Discord OAuth 登录 (账号需绑定 Discord)...")
+    try:
+        # 1) 点击登录页的 Discord 按钮
+        clicked = False
+        for sel in ('a:contains("Discord")', 'button:contains("Discord")',
+                    'a[href*="discord.com/oauth2"]', '[data-provider="discord"]'):
+            try:
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    clicked = True
+                    log(f"✅ 已点击 Discord 登录按钮: {sel}")
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            log("❌ 未找到 Discord 登录按钮")
+            return None
+
+        # 2) 等待跳转到 discord.com 并抓取 authorize URL
+        auth_url = None
+        for _ in range(20):
+            url = sb.get_current_url()
+            if "discord.com/oauth2/authorize" in url or "discord.com/api/oauth2" in url:
+                auth_url = url
+                break
+            sb.sleep(1)
+        if not auth_url:
+            log(f"❌ 未跳转到 Discord, 当前 URL: {sb.get_current_url()[:120]}")
+            try:
+                sb.save_screenshot("acl_discord_no_redirect.png")
+            except Exception:
+                pass
+            return None
+        log(f"📝 Discord authorize URL: {auth_url[:160]}")
+
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
+        client_id = (params.get("client_id") or [""])[0]
+        state = (params.get("state") or [""])[0]
+        redirect_uri = (params.get("redirect_uri") or [""])[0]
+        scope = (params.get("scope") or [""])[0]
+        if not (client_id and state and redirect_uri):
+            log("❌ authorize URL 缺少参数 (client_id/state/redirect_uri)")
+            return None
+        log(f"   client_id={client_id} | redirect={redirect_uri[:60]} | scope={scope or '(默认)'}")
+
+        # 3) 用 Discord token 请求授权, 拿带 code 的回调 URL (bot-hosting 同款)
+        disc_url = ("https://discord.com/api/v9/oauth2/authorize?"
+                    + urllib.parse.urlencode({
+                        "client_id": client_id,
+                        "response_type": "code",
+                        "redirect_uri": redirect_uri,
+                        "scope": scope or "identify email guilds",
+                        "state": state,
+                    }))
+        try:
+            resp = requests.get(
+                disc_url,
+                headers={
+                    "Authorization": DISCORD_TOKEN,
+                    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"),
+                },
+                allow_redirects=False, timeout=20,
+            )
+        except Exception as e:
+            log(f"❌ Discord 授权请求异常: {e}")
+            return None
+        if resp.status_code not in (301, 302):
+            log(f"❌ Discord 授权失败: HTTP {resp.status_code} - {resp.text[:150]}")
+            return None
+        callback = resp.headers.get("Location", "")
+        if not callback:
+            log("❌ 授权响应无 Location")
+            return None
+        log(f"✅ 拿到回调 URL: {re.sub(r'code=[^&]+', 'code=***', callback)[:120]}")
+
+        # 4) 浏览器打开回调完成登录
+        sb.uc_open_with_reconnect(callback, reconnect_time=4)
+        sb.sleep(3)
+        logged_in = False
+        for _ in range(40):
+            url = sb.get_current_url()
+            if "auth/login" not in url and "login" not in url.lower():
+                logged_in = True
+                break
+            sb.sleep(1)
+        if not logged_in:
+            log(f"❌ OAuth 回调后未跳转, 当前: {sb.get_current_url()[:120]}")
+            try:
+                print("   📝 页面内容:", sb.get_text("body")[:200])
+            except Exception:
+                pass
+            return None
+        log(f"✅ Discord OAuth 登录成功: {sb.get_current_url()[:80]}")
+
+        # 5) 提取 cookie
+        cookies = sb.get_cookies()
+        xsrf = session = None
+        for c in cookies:
+            if c.get("name") == "XSRF-TOKEN":
+                xsrf = c.get("value")
+            if c.get("name") == "__Host-aclclouds_session":
+                session = c.get("value")
+        if not (xsrf and session):
+            log("❌ 登录成功但未拿到 cookie")
+            print("   cookie 名:", [c.get("name") for c in cookies])
+            return None
+        cookie = f"XSRF-TOKEN={xsrf}; __Host-aclclouds_session={session}"
+        log(f"✅ Discord OAuth 登录完成, 已获取新 Cookie (session 前 8 位: {session[:8]}...)")
+        return cookie
+    except Exception as e:
+        log(f"💥 Discord OAuth 异常: {e}")
+        return None
+
+
 def browser_login():
     """用浏览器登录 aclclouds.com, 返回 Cookie 字符串; 失败返回 None
 
@@ -530,14 +656,9 @@ def browser_login():
                     break
                 sb.sleep(2)
             if not widget_seen:
-                log("⚠️ 30 秒内未出现 Turnstile iframe")
-                log("   可能原因: Turnstile 脚本被代理拦截 / CF 对该 IP 不给完整组件")
-                log("   建议: 换干净住宅代理 (NODE_LINK), 或改用 Google/Discord OAuth 登录")
-                try:
-                    sb.save_screenshot("acl_login_no_widget.png")
-                except Exception:
-                    pass
-                return None
+                log("⚠️ 30 秒内未出现 Turnstile iframe (组件被拦或未加载)")
+                log("   改用 Discord OAuth 登录回退...")
+                return _discord_oauth_login(sb)
 
             # 2) 点击复选框直到 token 生成
             turnstile_ok = False
@@ -559,12 +680,8 @@ def browser_login():
                 log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
             if not turnstile_ok:
                 log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控)")
-                log("   → 确认 NODE_LINK / 本地代理是干净住宅 IP; 机房 IP 过不了 Turnstile")
-                try:
-                    sb.save_screenshot("acl_login_captcha_failed.png")
-                except Exception:
-                    pass
-                return None
+                log("   改用 Discord OAuth 登录回退...")
+                return _discord_oauth_login(sb)
 
             # 提交登录 + 等待跳转 (验证码失败时自动重试一轮)
             logged_in = False
