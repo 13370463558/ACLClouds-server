@@ -115,6 +115,49 @@ def parse_iso(s):
 
 
 # ==================== API 会话 (纯 HTTP) ====================
+def sanitize_cookie(cookie_str):
+    """清洗 Cookie 字符串, 保证可以作为 HTTP header 发送
+
+    常见坑 (会触发 requests 的 Invalid header value 异常):
+    - 复制时带了换行/回车
+    - 误粘贴了 curl 的 "Cookie: ..." 前缀
+    - 值带了引号或非 latin-1 字符 (中文/emoji)
+    返回清洗后的 "; " 分隔字符串。
+    """
+    s = (cookie_str or "").strip()
+    if not s:
+        return ""
+    # 去掉误粘贴的 "Cookie:" 前缀
+    if s.lower().startswith("cookie:"):
+        s = s[len("cookie:"):].strip()
+    # 去掉两端包裹的引号
+    if len(s) >= 2 and s[0] in ('"', "'") and s[-1] == s[0]:
+        s = s[1:-1]
+    # 折叠所有空白/控制字符 (换行、回车、制表符等)
+    s = re.sub(r"\s+", " ", s)
+
+    parts = []
+    for kv in s.split(";"):
+        kv = kv.strip()
+        if not kv or "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k or not v:
+            continue
+        # 丢弃含非法字符的条目 (非 latin-1 或控制字符), 避免 header 校验失败
+        try:
+            b = v.encode("latin-1")
+        except UnicodeEncodeError:
+            log(f"⚠️ Cookie 条目 {k} 含非 latin-1 字符, 已丢弃 (请重新复制)")
+            continue
+        if any(c < 0x20 or c == 0x7f for c in b):
+            log(f"⚠️ Cookie 条目 {k} 含控制字符, 已丢弃 (请重新复制)")
+            continue
+        parts.append(f"{k}={v}")
+    return "; ".join(parts)
+
+
 def build_api_session(cookie_str):
     """构建 API session, 原样保留 __Host- 前缀 Cookie
 
@@ -130,7 +173,7 @@ def build_api_session(cookie_str):
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/dashboard",
     })
-    s._raw_cookie = cookie_str.strip()
+    s._raw_cookie = sanitize_cookie(cookie_str)
     return s
 
 
@@ -385,6 +428,16 @@ def process_account(label, cookie_str):
 
         # 改版后的续期状态字段
         can_renew, free_left, reason = renewal_availability(attrs, detail)
+        # 面板自动续期开关 (改版新增): auto_renew=true 时由面板自己续, 脚本跳过
+        auto_renew = None
+        for c in (attrs, detail):
+            if isinstance(c, dict) and c.get("auto_renew") is not None:
+                auto_renew = bool(c.get("auto_renew"))
+                break
+        if auto_renew:
+            log(f"  ⏭️ {name}: 面板已开启自动续期 (auto_renew=true), 无需脚本处理")
+            skipped.append(f"⏭️ {name}: auto_renew=true (面板自动续期)")
+            continue
         if can_renew is False:
             log(f"  ⏭️ {name}: {reason or '不可续期'}")
             skipped.append(f"⏭️ {name}: {reason or '不可续期'}")
