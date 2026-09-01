@@ -489,39 +489,59 @@ def browser_login():
                     pass
                 return None
 
-            # Turnstile: 多次点击直到真正通过 (响应 token 生成 / 页面验证提示消失)
+            # Turnstile: 先等组件 iframe 出现, 再点击直到 token 真正生成
             log("🔒 尝试通过 Turnstile 验证...")
+
+            def _page_iframes():
+                """原生 driver 枚举 iframe (sb.execute_script 在登录页返回值不可靠)"""
+                try:
+                    sb.driver.switch_to.default_content()
+                    frs = sb.driver.find_elements("css selector", "iframe")
+                    return [(f.get_attribute("src") or "") + " " + (f.get_attribute("title") or "")
+                            for f in frs]
+                except Exception:
+                    return []
 
             def _captcha_passed():
                 try:
-                    tok = sb.execute_script("""
-                        (function(){
-                            const el = document.querySelector(
-                                'textarea[name="cf-turnstile-response"], input[name="cf-turnstile-response"]');
-                            return !!(el && el.value && el.value.length > 10);
-                        })()
-                    """)
+                    sb.driver.switch_to.default_content()
+                    tok = sb.driver.execute_script(
+                        "var el=document.querySelector('textarea[name=\"cf-turnstile-response\"],"
+                        "input[name=\"cf-turnstile-response\"]');"
+                        "return !!(el&&el.value&&el.value.length>10);")
                     if tok:
                         return True
+                except Exception:
+                    pass
+                try:
                     pg = sb.get_page_source().lower()
-                    # 验证提示消失也视为通过
                     return not any(k in pg for k in
                                    ("i am not a robot", "captcha incorrect", "secured by aclclouds"))
                 except Exception:
-                    return False
+                    return True
 
+            # 1) 等 Turnstile iframe 出现 (最多 30s)
+            widget_seen = False
+            for _ in range(15):
+                frs = _page_iframes()
+                if frs and any(("cloudflare" in x.lower()) or ("turnstile" in x.lower()) for x in frs):
+                    log(f"🔍 检测到 Turnstile iframe: {[x[:70] for x in frs]}")
+                    widget_seen = True
+                    break
+                sb.sleep(2)
+            if not widget_seen:
+                log("⚠️ 30 秒内未出现 Turnstile iframe")
+                log("   可能原因: Turnstile 脚本被代理拦截 / CF 对该 IP 不给完整组件")
+                log("   建议: 换干净住宅代理 (NODE_LINK), 或改用 Google/Discord OAuth 登录")
+                try:
+                    sb.save_screenshot("acl_login_no_widget.png")
+                except Exception:
+                    pass
+                return None
+
+            # 2) 点击复选框直到 token 生成
             turnstile_ok = False
             for attempt in range(1, 5):
-                if attempt == 1:
-                    # 诊断: 打印页面上的 iframe (Turnstile 位于 challenges.cloudflare.com iframe)
-                    try:
-                        frs = sb.execute_script("""
-                            (function(){return Array.from(document.querySelectorAll('iframe'))
-                                .map(f => f.src || f.title || '').filter(x => x);})()
-                        """)
-                        log(f"🔍 页面 iframe: {frs}")
-                    except Exception:
-                        pass
                 clicked = False
                 try:
                     clicked = sb.uc_gui_click_captcha()
@@ -536,7 +556,7 @@ def browser_login():
                     turnstile_ok = True
                     log("✅ Turnstile 验证已通过 (响应 token 已生成)")
                     break
-                log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试点击...")
+                log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
             if not turnstile_ok:
                 log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控)")
                 log("   → 确认 NODE_LINK / 本地代理是干净住宅 IP; 机房 IP 过不了 Turnstile")
