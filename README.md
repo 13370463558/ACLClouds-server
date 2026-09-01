@@ -34,7 +34,8 @@
 
 | Secret 名称 | 必填 | 说明 |
 | --- | --- | --- |
-| `ACL_COOKIES` | ✅ | 单账号 Cookie 字符串 |
+| `ACL_COOKIES` | XSRF-TOKEN=<浏览器里的值>; __Host-aclclouds_session=<你贴的这个值>
+
 | `ACL_ACCOUNTS` | 多账号 | 格式: `name1\|\|\|cookie1\nname2\|\|\|cookie2` (每行一个) |
 | `TG_BOT_TOKEN` | TG 通知 | Telegram Bot Token |
 | `TG_CHAT_ID` | TG 通知 | 接收通知的 Chat ID |
