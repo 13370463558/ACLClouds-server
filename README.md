@@ -23,7 +23,6 @@
 1. 用浏览器登录 <https://aclclouds.com/dashboard> (⚠️ 不是 dash.aclclouds.com)
 2. 按 `F12` 打开开发者工具 → `Application` (或 `存储` / `Storage`) → `Cookies` → `https://aclclouds.com`
 3. 复制全部 Cookie 为一个字符串 (格式: `key1=value1; key2=value2; ...`)
-
 > 必须包含这两个关键 Cookie: `XSRF-TOKEN` 和 `__Host-aclclouds_session`
 >
 > 推荐用浏览器扩展 **EditThisCookie** / **Cookie-Editor** 一键导出 → "导出为 Header 字符串"
@@ -35,11 +34,9 @@
 | Secret 名称 | 必填 | 说明 |
 | --- | --- | --- |
 | `ACL_COOKIES` | XSRF-TOKEN=<浏览器里的值>; __Host-aclclouds_session=<你贴的这个值>
-
 | `ACL_ACCOUNTS` | 多账号 | 格式: `name1\|\|\|cookie1\nname2\|\|\|cookie2` (每行一个) |
 | `TG_BOT_TOKEN` | TG 通知 | Telegram Bot Token |
 | `TG_CHAT_ID` | TG 通知 | 接收通知的 Chat ID |
-
 > `ACL_ACCOUNTS` 和 `ACL_COOKIES` 二选一, 同时配置时 `ACL_ACCOUNTS` 优先
 
 ### 4. 手动测试
