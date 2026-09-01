@@ -23,8 +23,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安装依赖 (含 seleniumbase, 用于浏览器自动登录)
+      - name: 安装系统依赖 (xvfb 供浏览器 GUI 操作 + 中文字体)
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-cjk
           pip install -r requirements.txt
           seleniumbase install chromedriver || true
 
@@ -45,5 +47,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        # renew_fixed.py: Cookie 登录优先; 401 或配置了账密时走浏览器自动登录
-        run: python renew_fixed.py
+        # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
+        run: xvfb-run --auto-servernum python renew_fixed.py

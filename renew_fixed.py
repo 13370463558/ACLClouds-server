@@ -392,6 +392,37 @@ def _dump_login_form(sb):
         print(f"⚠️ 枚举登录表单失败: {e}")
 
 
+def _click_turnstile(sb):
+    """切换到 Turnstile 复选框 iframe 直接点击 (无头/无显示器环境可用)
+
+    返回是否找到并点击。uc_gui_click_captcha() 依赖真实屏幕坐标,
+    在 GitHub Actions (无显示器) 下会一直返回 False。
+    """
+    try:
+        sb.driver.switch_to.default_content()
+        iframes = sb.driver.find_elements("css selector", "iframe")
+        for ifr in iframes:
+            src = (ifr.get_attribute("src") or "") + " " + (ifr.get_attribute("title") or "")
+            if any(k in src.lower() for k in ("challenges.cloudflare.com", "turnstile", "checkbox")):
+                sb.driver.switch_to.frame(ifr)
+                ok = False
+                for js in (
+                    "var c=document.querySelector('input[type=checkbox]');if(c){c.click();true}else false",
+                    "var e=document.querySelector('label,div[role=checkbox],.rc-anchor');if(e){e.click();true}else false",
+                ):
+                    try:
+                        if sb.driver.execute_script(js):
+                            ok = True
+                            break
+                    except Exception:
+                        continue
+                sb.driver.switch_to.default_content()
+                return ok
+    except Exception:
+        pass
+    return False
+
+
 def browser_login():
     """用浏览器登录 aclclouds.com, 返回 Cookie 字符串; 失败返回 None
 
@@ -481,11 +512,25 @@ def browser_login():
 
             turnstile_ok = False
             for attempt in range(1, 5):
+                if attempt == 1:
+                    # 诊断: 打印页面上的 iframe (Turnstile 位于 challenges.cloudflare.com iframe)
+                    try:
+                        frs = sb.execute_script("""
+                            (function(){return Array.from(document.querySelectorAll('iframe'))
+                                .map(f => f.src || f.title || '').filter(x => x);})()
+                        """)
+                        log(f"🔍 页面 iframe: {frs}")
+                    except Exception:
+                        pass
+                clicked = False
                 try:
                     clicked = sb.uc_gui_click_captcha()
-                    log(f"   第 {attempt} 次点击验证框: {'已点击' if clicked else '未找到/无需点击'}")
                 except Exception as e:
-                    log(f"   ⚠️ 点击验证框异常: {e}")
+                    log(f"   ⚠️ uc 点击异常: {e}")
+                if not clicked:
+                    # 无真实显示器时 GUI 点击不可用, 改 iframe 直接点击
+                    clicked = _click_turnstile(sb)
+                log(f"   第 {attempt} 次点击验证框: {'已点击' if clicked else '未找到'}")
                 sb.sleep(8)
                 if _captcha_passed():
                     turnstile_ok = True
