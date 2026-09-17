@@ -892,16 +892,8 @@ def process_account(label, cookie_str):
 
         # 改版后的续期状态字段
         can_renew, free_left, reason = renewal_availability(attrs, detail)
-        # 面板自动续期开关 (改版新增): auto_renew=true 时由面板自己续, 脚本跳过
-        auto_renew = None
-        for c in (attrs, detail):
-            if isinstance(c, dict) and c.get("auto_renew") is not None:
-                auto_renew = bool(c.get("auto_renew"))
-                break
-        if auto_renew:
-            log(f"  ⏭️ {name}: 面板已开启自动续期 (auto_renew=true), 无需脚本处理")
-            skipped.append(f"⏭️ {name}: auto_renew=true (面板自动续期)")
-            continue
+        # 注意: 面板的 auto_renew 字段不可信 —— 面板实际上不会自动续期,
+        # 因此不再依据它跳过, 是否续期完全由下面的 can_renew / 剩余时间阈值决定
         if can_renew is False:
             log(f"  ⏭️ {name}: {reason or '不可续期'}")
             skipped.append(f"⏭️ {name}: {reason or '不可续期'}")
